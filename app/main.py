@@ -39,45 +39,58 @@ async def webhook_twilio(
     return PlainTextResponse(content=twiml, media_type="application/xml")
 
 
+def identificar_pagador(pago: dict) -> str:
+    """
+    Devuelve el nombre del titular si está disponible,
+    sino el email, sino 'desconocido'.
+    """
+    nombre = pago.get("_nombre_pagador")
+    if nombre:
+        return nombre
+    email = pago.get("payer", {}).get("email", "")
+    return email if email else "desconocido"
+
+
 def formatear_respuesta(resultado: dict, monto_consultado: float | None) -> str:
+
     # --- Modo lista de pagos ---
     if resultado.get("modo_lista"):
         pagos = resultado.get("pagos", [])
         if not pagos:
-            return "❌ No hubo pagos en la última hora."
-        
-        lineas = ["📋 *Últimos pagos recibidos:*\n"]
+            return "❌ No hubo pagos en la ultima hora."
+
+        lineas = ["📋 *Ultimos pagos recibidos:*\n"]
         for i, pago in enumerate(pagos, 1):
             monto = pago.get("transaction_amount", 0)
             hora = pago.get("date_approved", "")[:16].replace("T", " ")
-            pagador = pago.get("payer", {}).get("email", "desconocido")
+            pagador = identificar_pagador(pago)
             lineas.append(f"{i}. 💰 ${monto:,.0f} | 🕐 {hora} | 👤 {pagador}")
-        
+
         return "\n".join(lineas)
 
     # --- Pago encontrado ---
     if resultado["encontrado"]:
         pago = resultado["pago"]
         monto = pago.get("transaction_amount", 0)
-        fecha = pago.get("date_approved", "sin fecha")[:16].replace("T", " ")
-        pagador = pago.get("payer", {}).get("email", "desconocido")
+        fecha = pago.get("date_approved", "")[:16].replace("T", " ")
+        pagador = identificar_pagador(pago)
         return (
             f"✅ *Pago confirmado*\n"
             f"💰 Monto: ${monto:,.0f}\n"
             f"🕐 Hora: {fecha}\n"
-            f"👤 Pagador: {pagador}"
+            f"👤 Titular: {pagador}"
         )
 
     # --- No encontrado ---
     ventana = resultado["ventana_minutos"]
     if monto_consultado:
         return (
-            f"❌ No se encontró ningún pago de ${monto_consultado:,.0f} "
-            f"en los últimos {ventana} minutos.\n"
-            f"Podés consultar con más tiempo: escribí *{int(monto_consultado):,} hace 30*"
+            f"❌ No se encontro ningun pago de ${monto_consultado:,.0f} "
+            f"en los ultimos {ventana} minutos.\n"
+            f"Podes consultar con mas tiempo: escribi *{int(monto_consultado):,} hace 30*"
         )
     return (
-        f"❌ No se encontró ningún pago reciente "
-        f"en los últimos {ventana} minutos.\n"
-        f"Para ver todos los pagos escribí: *últimos pagos*"
+        f"❌ No se encontro ningun pago reciente "
+        f"en los ultimos {ventana} minutos.\n"
+        f"Para ver todos los pagos escribi: *ultimos pagos*"
     )
