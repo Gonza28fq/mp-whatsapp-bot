@@ -12,70 +12,55 @@ TOLERANCIA_PORCENTAJE = 0.02
 # Zona horaria Argentina: UTC-3
 ARG_OFFSET = timedelta(hours=-3)
 
-
 def formatear_hora_arg(fecha_str: str) -> str:
     if not fecha_str:
         return "sin hora"
     try:
-        fecha_str = fecha_str[:19]
-        dt_utc = datetime.strptime(fecha_str, "%Y-%m-%dT%H:%M:%S")
-        dt_arg = dt_utc + ARG_OFFSET
+        # Mercado Pago suele enviar: 2024-03-27T15:48:10.000-04:00
+        # Usamos fromisoformat para manejar offsets correctamente
+        dt = datetime.fromisoformat(fecha_str.replace("Z", "+00:00"))
+        dt_arg = dt.astimezone(timezone(ARG_OFFSET))
         return dt_arg.strftime("%d/%m %H:%M")
-    except Exception:
+    except Exception as e:
+        logger.error(f"Error formateando fecha {fecha_str}: {e}")
         return fecha_str[:16].replace("T", " ")
-
 
 def extraer_identificador_pagador(pago: dict) -> str:
     """
-    Extrae el mejor identificador disponible del pagador
-    usando SOLO los datos que vienen en el objeto pago,
-    sin hacer llamadas adicionales a la API.
-
-    Orden de prioridad:
-    1. first_name + last_name del payer
-    2. name del payer
-    3. cardholder name (si pago con tarjeta)
-    4. identification number (DNI/CUIT)
-    5. email
-    6. "desconocido"
+    Extrae el mejor identificador posible del pagador.
+    Se añade búsqueda en point_of_interaction para transferencias.
     """
     payer = pago.get("payer") or {}
-
-    # Log completo del payer para diagnostico
-    logger.info(f"Datos del payer: {payer}")
-
-    # 1. Nombre directo en payer
+    
+    # 1. Intentar obtener nombre de transaction_details (común en transferencias)
+    details = pago.get("transaction_details") or {}
+    external_resource = details.get("external_resource_url") # A veces ayuda a identificar el origen
+    
+    # 2. Nombre directo en payer
     first = (payer.get("first_name") or "").strip()
     last = (payer.get("last_name") or "").strip()
     if first or last:
         return f"{first} {last}".strip()
 
-    # 2. Campo name
-    name = (payer.get("name") or "").strip()
-    if name:
-        return name
+    # 3. Datos de identificación (DNI/CUIT) - Validando que no sea "0"
+    ident = payer.get("identification") or {}
+    id_num = str(ident.get("number") or "").strip()
+    if id_num and id_num not in ["0", "", "None"]:
+        id_type = ident.get("type") or "ID"
+        return f"{id_type}: {id_num}"
 
-    # 3. Cardholder name (pagos con tarjeta)
-    card = pago.get("card") or {}
-    cardholder = card.get("cardholder") or {}
-    card_name = (cardholder.get("name") or "").strip()
-    if card_name:
-        return card_name
-
-    # 4. DNI/CUIT de identification
-    identification = payer.get("identification") or {}
-    id_type = (identification.get("type") or "").strip()
-    id_number = (identification.get("number") or "").strip()
-    if id_number and id_number != "0":
-        return f"{id_type} {id_number}".strip() if id_type else id_number
-
-    # 5. Email
+    # 4. Email (Suele ser lo más confiable si no hay nombre)
     email = (payer.get("email") or "").strip()
-    if email and email != "":
+    if email and "@" in email:
         return email
 
-    return "sin datos"
+    # 5. Metadata o campos adicionales de MP
+    # Si es una transferencia, el nombre a veces viene en 'description' o 'metadata'
+    description = pago.get("description") or ""
+    if "Transferencia de" in description:
+        return description.replace("Transferencia de", "").strip()
 
+    return "Usuario MP (ID: " + str(payer.get("id", "S/D")) + ")"
 
 async def buscar_pago_reciente(
     monto: float | None = None,
@@ -86,62 +71,60 @@ async def buscar_pago_reciente(
     if not MP_ACCESS_TOKEN:
         raise EnvironmentError("MP_ACCESS_TOKEN no está configurado.")
 
+    # Ajuste de tiempo: MP usa ISO 8601
     ahora = datetime.now(timezone.utc)
     desde = ahora - timedelta(minutes=ventana_minutos)
-    desde_str = desde.strftime("%Y-%m-%dT%H:%M:%S.000-00:00")
+    # Formato aceptado por MP: 2024-03-27T10:00:00.000-00:00
+    desde_str = desde.isoformat(timespec='milliseconds')
 
     params = {
-        "sort": "date_created",
+        "sort": "date_approved", # Ordenar por aprobación es más preciso para tu caso
         "criteria": "desc",
-        "range": "date_approved",
         "begin_date": desde_str,
         "end_date": "NOW",
         "status": "approved",
     }
 
-    headers = {"Authorization": f"Bearer {MP_ACCESS_TOKEN}"}
+    headers = {
+        "Authorization": f"Bearer {MP_ACCESS_TOKEN}",
+        "Content-Type": "application/json"
+    }
 
-    logger.info(f"Consultando MP | monto={monto} | ventana={ventana_minutos}min | lista={modo_lista}")
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        try:
+            response = await client.get(
+                f"{MP_API_BASE}/v1/payments/search",
+                params=params,
+                headers=headers,
+            )
+            response.raise_for_status()
+            data = response.json()
+        except Exception as e:
+            logger.error(f"Error conectando a MP: {e}")
+            return {"encontrado": False, "pago": None, "pagos": [], "error": str(e)}
 
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        response = await client.get(
-            f"{MP_API_BASE}/v1/payments/search",
-            params=params,
-            headers=headers,
-        )
+        pagos_raw = data.get("results", [])
+        pagos_procesados = []
 
-        if response.status_code != 200:
-            raise Exception(f"Error MP API: {response.status_code}")
+        for p in pagos_raw[:10]: # Analizamos un poco más de los que mostramos por si hay filtros
+            p["_nombre_pagador"] = extraer_identificador_pagador(p)
+            p["_hora_arg"] = formatear_hora_arg(p.get("date_approved"))
+            p["_email_pagador"] = p.get("payer", {}).get("email", "Sin email")
+            p["_monto_limpio"] = float(p.get("transaction_amount", 0))
+            
+            # Filtro por monto si no es modo lista
+            if monto:
+                diferencia = abs(p["_monto_limpio"] - monto) / monto if monto > 0 else 1
+                if diferencia <= TOLERANCIA_PORCENTAJE:
+                    pagos_procesados.append(p)
+                    if not modo_lista: break # Encontramos el que buscábamos
+            else:
+                pagos_procesados.append(p)
 
-        data = response.json()
-        pagos = data.get("results", [])
-
-        logger.info(f"Pagos en ventana: {len(pagos)}")
-
-        # Enriquecer pagos con identificador y hora
-        for pago in pagos[:max_resultados]:
-            pago["_nombre_pagador"] = extraer_identificador_pagador(pago)
-            pago["_hora_arg"] = formatear_hora_arg(pago.get("date_approved", ""))
-
-        if modo_lista:
-            return {
-                "encontrado": len(pagos) > 0,
-                "pago": None,
-                "pagos": pagos[:max_resultados],
-                "ventana_minutos": ventana_minutos,
-                "modo_lista": True,
-            }
-
-        if not pagos:
-            return {"encontrado": False, "pago": None, "pagos": [], "ventana_minutos": ventana_minutos, "modo_lista": False}
-
-        if monto is None:
-            return {"encontrado": True, "pago": pagos[0], "pagos": [], "ventana_minutos": ventana_minutos, "modo_lista": False}
-
-        for pago in pagos:
-            monto_pago = float(pago.get("transaction_amount", 0))
-            diferencia = abs(monto_pago - monto) / monto if monto > 0 else 1
-            if diferencia <= TOLERANCIA_PORCENTAJE:
-                return {"encontrado": True, "pago": pago, "pagos": [], "ventana_minutos": ventana_minutos, "modo_lista": False}
-
-        return {"encontrado": False, "pago": None, "pagos": [], "ventana_minutos": ventana_minutos, "modo_lista": False}
+        return {
+            "encontrado": len(pagos_procesados) > 0,
+            "pago": pagos_procesados[0] if pagos_procesados else None,
+            "pagos": pagos_procesados[:max_resultados],
+            "ventana_minutos": ventana_minutos,
+            "modo_lista": modo_lista
+        }
