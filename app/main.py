@@ -22,11 +22,12 @@ async def webhook_twilio(
 ):
     logger.info(f"Mensaje de {From}: {Body}")
 
-    monto, ventana_minutos, modo_lista = parsear_mensaje(Body)
+    monto, ventana_minutos, modo_lista, max_resultados = parsear_mensaje(Body)
     resultado = await buscar_pago_reciente(
         monto=monto,
         ventana_minutos=ventana_minutos,
         modo_lista=modo_lista,
+        max_resultados=max_resultados,
     )
 
     respuesta = formatear_respuesta(resultado, monto)

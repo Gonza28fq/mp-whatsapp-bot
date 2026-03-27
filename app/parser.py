@@ -24,6 +24,7 @@ FRASES_ULTIMOS_PAGOS = [
     "pagos recientes", "que pagos hubo", "qué pagos hubo",
     "mostrar pagos", "ver pagos", "listar pagos",
     "cuantos pagos", "cuántos pagos", "pagos de hoy",
+    "ultimos", "últimos",  # cubre "últimos 4 pagos", "últimos 3", etc.
 ]
 
 
@@ -38,8 +39,12 @@ def parsear_mensaje(texto: str) -> tuple[float | None, int, bool]:
 
     # --- Detectar si pide lista de últimos pagos ---
     if any(frase in texto_lower for frase in FRASES_ULTIMOS_PAGOS):
-        logger.info("Modo lista de pagos detectado")
-        return None, 60, True
+        # Detectar si especifica cantidad: "últimos 4 pagos" → max_resultados=4
+        match_n = re.search(r"(?:ultimos|últimos)\s+(\d+)", texto_lower)
+        n = int(match_n.group(1)) if match_n else 5
+        n = max(1, min(n, 10))  # clamp entre 1 y 10
+        logger.info(f"Modo lista de pagos detectado | n={n}")
+        return None, 60, True, n
 
     # --- Extraer ventana de tiempo si la especifica ---
     ventana_minutos = VENTANA_DEFAULT
@@ -59,10 +64,10 @@ def parsear_mensaje(texto: str) -> tuple[float | None, int, bool]:
         monto = normalizar_monto(monto_str)
         if monto and monto > 0:
             logger.info(f"Monto parseado: ${monto} | ventana: {ventana_minutos}min")
-            return monto, ventana_minutos, False
+            return monto, ventana_minutos, False, 5
 
     logger.info(f"Consulta general detectada | ventana: {ventana_minutos}min")
-    return None, ventana_minutos, False
+    return None, ventana_minutos, False, 5
 
 
 def normalizar_monto(monto_str: str) -> float | None:
