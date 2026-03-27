@@ -14,15 +14,10 @@ ARG_OFFSET = timedelta(hours=-3)
 
 
 def formatear_hora_arg(fecha_str: str) -> str:
-    """
-    Convierte una fecha ISO de MP (UTC) a hora argentina.
-    Ejemplo: "2026-03-26T20:25:35.000-00:00" → "26/03 23:25"
-    """
     if not fecha_str:
         return "sin hora"
     try:
-        # Normalizar el string de fecha
-        fecha_str = fecha_str[:19]  # tomar solo "2026-03-26T20:25:35"
+        fecha_str = fecha_str[:19]
         dt_utc = datetime.strptime(fecha_str, "%Y-%m-%dT%H:%M:%S")
         dt_arg = dt_utc + ARG_OFFSET
         return dt_arg.strftime("%d/%m %H:%M")
@@ -30,47 +25,56 @@ def formatear_hora_arg(fecha_str: str) -> str:
         return fecha_str[:16].replace("T", " ")
 
 
-async def obtener_nombre_pagador(client: httpx.AsyncClient, pago: dict) -> str:
+def extraer_identificador_pagador(pago: dict) -> str:
     """
-    Intenta obtener el nombre del titular por múltiples vías.
-    Fallback final: email del pagador.
+    Extrae el mejor identificador disponible del pagador
+    usando SOLO los datos que vienen en el objeto pago,
+    sin hacer llamadas adicionales a la API.
+
+    Orden de prioridad:
+    1. first_name + last_name del payer
+    2. name del payer
+    3. cardholder name (si pago con tarjeta)
+    4. identification number (DNI/CUIT)
+    5. email
+    6. "desconocido"
     """
-    headers = {"Authorization": f"Bearer {MP_ACCESS_TOKEN}"}
-    payer = pago.get("payer", {})
+    payer = pago.get("payer") or {}
 
-    # --- Intento 1: nombre directo en el objeto payer ---
-    nombre = (payer.get("first_name") or "").strip()
-    apellido = (payer.get("last_name") or "").strip()
-    if nombre or apellido:
-        return f"{nombre} {apellido}".strip()
+    # Log completo del payer para diagnostico
+    logger.info(f"Datos del payer: {payer}")
 
-    # --- Intento 2: consulta a /v4/users/{payer_id} ---
-    payer_id = str(payer.get("id", ""))
-    if payer_id and payer_id != "0":
-        try:
-            response = await client.get(
-                f"{MP_API_BASE}/v4/users/{payer_id}",
-                headers=headers,
-                timeout=5.0,
-            )
-            if response.status_code == 200:
-                data = response.json()
-                full = (data.get("full_name") or "").strip()
-                if full:
-                    return full
-                first = (data.get("first_name") or "").strip()
-                last = (data.get("last_name") or "").strip()
-                if first or last:
-                    return f"{first} {last}".strip()
-                nick = (data.get("nickname") or "").strip()
-                if nick:
-                    return nick
-        except Exception as e:
-            logger.warning(f"Error consultando usuario {payer_id}: {e}")
+    # 1. Nombre directo en payer
+    first = (payer.get("first_name") or "").strip()
+    last = (payer.get("last_name") or "").strip()
+    if first or last:
+        return f"{first} {last}".strip()
 
-    # --- Fallback final: email ---
+    # 2. Campo name
+    name = (payer.get("name") or "").strip()
+    if name:
+        return name
+
+    # 3. Cardholder name (pagos con tarjeta)
+    card = pago.get("card") or {}
+    cardholder = card.get("cardholder") or {}
+    card_name = (cardholder.get("name") or "").strip()
+    if card_name:
+        return card_name
+
+    # 4. DNI/CUIT de identification
+    identification = payer.get("identification") or {}
+    id_type = (identification.get("type") or "").strip()
+    id_number = (identification.get("number") or "").strip()
+    if id_number and id_number != "0":
+        return f"{id_type} {id_number}".strip() if id_type else id_number
+
+    # 5. Email
     email = (payer.get("email") or "").strip()
-    return email if email else "desconocido"
+    if email and email != "":
+        return email
+
+    return "sin datos"
 
 
 async def buscar_pago_reciente(
@@ -114,9 +118,9 @@ async def buscar_pago_reciente(
 
         logger.info(f"Pagos en ventana: {len(pagos)}")
 
-        # Enriquecer con nombre y hora argentina
+        # Enriquecer pagos con identificador y hora
         for pago in pagos[:max_resultados]:
-            pago["_nombre_pagador"] = await obtener_nombre_pagador(client, pago)
+            pago["_nombre_pagador"] = extraer_identificador_pagador(pago)
             pago["_hora_arg"] = formatear_hora_arg(pago.get("date_approved", ""))
 
         if modo_lista:
