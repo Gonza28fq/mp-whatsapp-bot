@@ -39,8 +39,8 @@ async def obtener_nombre_pagador(client: httpx.AsyncClient, pago: dict) -> str:
     payer = pago.get("payer", {})
 
     # --- Intento 1: nombre directo en el objeto payer ---
-    nombre = payer.get("first_name", "").strip()
-    apellido = payer.get("last_name", "").strip()
+    nombre = (payer.get("first_name") or "").strip()
+    apellido = (payer.get("last_name") or "").strip()
     if nombre or apellido:
         return f"{nombre} {apellido}".strip()
 
@@ -55,21 +55,21 @@ async def obtener_nombre_pagador(client: httpx.AsyncClient, pago: dict) -> str:
             )
             if response.status_code == 200:
                 data = response.json()
-                full = data.get("full_name", "").strip()
+                full = (data.get("full_name") or "").strip()
                 if full:
                     return full
-                first = data.get("first_name", "").strip()
-                last = data.get("last_name", "").strip()
+                first = (data.get("first_name") or "").strip()
+                last = (data.get("last_name") or "").strip()
                 if first or last:
                     return f"{first} {last}".strip()
-                nick = data.get("nickname", "").strip()
+                nick = (data.get("nickname") or "").strip()
                 if nick:
                     return nick
         except Exception as e:
             logger.warning(f"Error consultando usuario {payer_id}: {e}")
 
     # --- Fallback final: email ---
-    email = payer.get("email", "").strip()
+    email = (payer.get("email") or "").strip()
     return email if email else "desconocido"
 
 
