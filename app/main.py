@@ -1,8 +1,8 @@
-from fastapi import FastAPI, Form
-from fastapi.responses import PlainTextResponse
+from fastapi import FastAPI, Form, Response
 from app.mercadopago import buscar_pago_reciente
 from app.parser import parsear_mensaje
 import logging
+import xml.etree.ElementTree as ET
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -12,10 +12,10 @@ app = FastAPI(title="MP WhatsApp Bot")
 
 @app.get("/")
 def health():
-    return {"status": "ok", "mensaje": "Bot activo ✅"}
+    return {"status": "ok", "mensaje": "Bot activo"}
 
 
-@app.post("/webhook", response_class=PlainTextResponse)
+@app.post("/webhook")
 async def webhook_twilio(
     Body: str = Form(...),
     From: str = Form(...),
@@ -32,12 +32,15 @@ async def webhook_twilio(
 
     respuesta = formatear_respuesta(resultado, monto)
 
-    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Message>{respuesta}</Message>
-</Response>"""
+    # Construir TwiML usando xml.etree para escapar correctamente
+    root = ET.Element("Response")
+    msg = ET.SubElement(root, "Message")
+    msg.text = respuesta
+    twiml = '<?xml version="1.0" encoding="UTF-8"?>' + ET.tostring(root, encoding="unicode")
 
-    return PlainTextResponse(content=twiml, media_type="application/xml")
+    logger.info(f"TwiML generado: {twiml[:200]}")
+
+    return Response(content=twiml, media_type="application/xml")
 
 
 def formatear_respuesta(resultado: dict, monto_consultado: float | None) -> str:
