@@ -27,40 +27,56 @@ def formatear_hora_arg(fecha_str: str) -> str:
 
 def extraer_identificador_pagador(pago: dict) -> str:
     """
-    Extrae el mejor identificador posible del pagador.
-    Se añade búsqueda en point_of_interaction para transferencias.
+    Versión mejorada para detectar nombres en transferencias bancarias,
+    alias y depósitos de Mercado Pago.
     """
     payer = pago.get("payer") or {}
     
-    # 1. Intentar obtener nombre de transaction_details (común en transferencias)
-    details = pago.get("transaction_details") or {}
-    external_resource = details.get("external_resource_url") # A veces ayuda a identificar el origen
+    # 1. BUSCAR EN POINT_OF_INTERACTION (Clave para transferencias CVU/SBU)
+    # Aquí es donde suele venir el nombre real del que transfiere
+    poi = pago.get("point_of_interaction") or {}
+    transaction_data = poi.get("transaction_data") or {}
     
-    # 2. Nombre directo en payer
+    # Intentamos varios campos donde MP suele esconder el nombre del emisor
+    nombre_transf = (
+        transaction_data.get("transefer_name") or   # Sí, a veces viene con el typo 'transefer'
+        transaction_data.get("transfer_name") or 
+        transaction_data.get("buyer_declaration") or
+        transaction_data.get("name")
+    )
+    
+    if nombre_transf and len(str(nombre_transf).strip()) > 2:
+        return str(nombre_transf).strip().title()
+
+    # 2. BUSCAR EN LA DESCRIPCIÓN DEL PAGO
+    # A veces dice "Transferencia de Juan Perez"
+    desc = (pago.get("description") or "").lower()
+    if "transferencia de" in desc:
+        return desc.replace("transferencia de", "").strip().title()
+
+    # 3. DATOS ESTÁNDAR DEL PAYER (Nombre y Apellido)
     first = (payer.get("first_name") or "").strip()
     last = (payer.get("last_name") or "").strip()
     if first or last:
-        return f"{first} {last}".strip()
+        return f"{first} {last}".strip().title()
 
-    # 3. Datos de identificación (DNI/CUIT) - Validando que no sea "0"
+    # 4. EMAIL (Si no hay nombre, el mail es lo más útil)
+    email = (payer.get("email") or "").strip()
+    if email and "@" in email and "test_user" not in email:
+        return email
+
+    # 5. DNI / CUIT
     ident = payer.get("identification") or {}
     id_num = str(ident.get("number") or "").strip()
     if id_num and id_num not in ["0", "", "None"]:
-        id_type = ident.get("type") or "ID"
-        return f"{id_type}: {id_num}"
+        return f"ID: {id_num}"
 
-    # 4. Email (Suele ser lo más confiable si no hay nombre)
-    email = (payer.get("email") or "").strip()
-    if email and "@" in email:
-        return email
+    # 6. ÚLTIMO RECURSO: ID de Usuario de MP
+    mp_id = payer.get("id")
+    if mp_id:
+        return f"Usuario MP ({mp_id})"
 
-    # 5. Metadata o campos adicionales de MP
-    # Si es una transferencia, el nombre a veces viene en 'description' o 'metadata'
-    description = pago.get("description") or ""
-    if "Transferencia de" in description:
-        return description.replace("Transferencia de", "").strip()
-
-    return "Usuario MP (ID: " + str(payer.get("id", "S/D")) + ")"
+    return "Pagador no identificado"
 
 async def buscar_pago_reciente(
     monto: float | None = None,
