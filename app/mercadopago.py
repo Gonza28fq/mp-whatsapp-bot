@@ -25,58 +25,46 @@ def formatear_hora_arg(fecha_str: str) -> str:
         logger.error(f"Error formateando fecha {fecha_str}: {e}")
         return fecha_str[:16].replace("T", " ")
 
-def extraer_identificador_pagador(pago: dict) -> str:
+def extraer_datos_pagador(pago: dict) -> dict:
     """
-    Versión mejorada para detectar nombres en transferencias bancarias,
-    alias y depósitos de Mercado Pago.
+    Extrae Nombre, Email e Identificación buscando en todos los 
+    recovecos de la API de Mercado Pago.
     """
     payer = pago.get("payer") or {}
-    
-    # 1. BUSCAR EN POINT_OF_INTERACTION (Clave para transferencias CVU/SBU)
-    # Aquí es donde suele venir el nombre real del que transfiere
     poi = pago.get("point_of_interaction") or {}
     transaction_data = poi.get("transaction_data") or {}
     
-    # Intentamos varios campos donde MP suele esconder el nombre del emisor
-    nombre_transf = (
-        transaction_data.get("transefer_name") or   # Sí, a veces viene con el typo 'transefer'
+    # 1. Intentar buscar NOMBRE en el objeto de transferencia (CVU/SBU)
+    nombre = (
+        transaction_data.get("transefer_name") or 
         transaction_data.get("transfer_name") or 
-        transaction_data.get("buyer_declaration") or
-        transaction_data.get("name")
+        transaction_data.get("buyer_declaration")
     )
     
-    if nombre_transf and len(str(nombre_transf).strip()) > 2:
-        return str(nombre_transf).strip().title()
-
-    # 2. BUSCAR EN LA DESCRIPCIÓN DEL PAGO
-    # A veces dice "Transferencia de Juan Perez"
-    desc = (pago.get("description") or "").lower()
-    if "transferencia de" in desc:
-        return desc.replace("transferencia de", "").strip().title()
-
-    # 3. DATOS ESTÁNDAR DEL PAYER (Nombre y Apellido)
-    first = (payer.get("first_name") or "").strip()
-    last = (payer.get("last_name") or "").strip()
-    if first or last:
-        return f"{first} {last}".strip().title()
-
-    # 4. EMAIL (Si no hay nombre, el mail es lo más útil)
+    # 2. Si no hay nombre en la transferencia, buscar en el perfil del Payer
+    if not nombre:
+        first = (payer.get("first_name") or "").strip()
+        last = (payer.get("last_name") or "").strip()
+        if first or last:
+            nombre = f"{first} {last}".strip()
+    
+    # 3. Extraer el EMAIL (Dato clave que pediste adjuntar)
     email = (payer.get("email") or "").strip()
-    if email and "@" in email and "test_user" not in email:
-        return email
+    
+    # 4. FALLBACK: Si sigue sin haber nombre, usar ID o DNI
+    if not nombre:
+        ident = payer.get("identification") or {}
+        id_num = str(ident.get("number") or "").strip()
+        if id_num and id_num not in ["0", "", "None"]:
+            nombre = f"ID: {id_num}"
+        else:
+            nombre = f"Usuario MP ({payer.get('id', 'S/D')})"
+        
+    return {
+        "nombre": nombre.title() if "Usuario MP" not in nombre else nombre,
+        "email": email if email else "sin email"
+    }
 
-    # 5. DNI / CUIT
-    ident = payer.get("identification") or {}
-    id_num = str(ident.get("number") or "").strip()
-    if id_num and id_num not in ["0", "", "None"]:
-        return f"ID: {id_num}"
-
-    # 6. ÚLTIMO RECURSO: ID de Usuario de MP
-    mp_id = payer.get("id")
-    if mp_id:
-        return f"Usuario MP ({mp_id})"
-
-    return "Pagador no identificado"
 
 async def buscar_pago_reciente(
     monto: float | None = None,
@@ -87,14 +75,13 @@ async def buscar_pago_reciente(
     if not MP_ACCESS_TOKEN:
         raise EnvironmentError("MP_ACCESS_TOKEN no está configurado.")
 
-    # Ajuste de tiempo: MP usa ISO 8601
+    # Manejo de tiempo robusto para evitar desfases con Railway/MP
     ahora = datetime.now(timezone.utc)
     desde = ahora - timedelta(minutes=ventana_minutos)
-    # Formato aceptado por MP: 2024-03-27T10:00:00.000-00:00
     desde_str = desde.isoformat(timespec='milliseconds')
 
     params = {
-        "sort": "date_approved", # Ordenar por aprobación es más preciso para tu caso
+        "sort": "date_approved",
         "criteria": "desc",
         "begin_date": desde_str,
         "end_date": "NOW",
@@ -106,6 +93,8 @@ async def buscar_pago_reciente(
         "Content-Type": "application/json"
     }
 
+    logger.info(f"Consultando MP | monto={monto} | ventana={ventana_minutos}min")
+
     async with httpx.AsyncClient(timeout=15.0) as client:
         try:
             response = await client.get(
@@ -116,27 +105,32 @@ async def buscar_pago_reciente(
             response.raise_for_status()
             data = response.json()
         except Exception as e:
-            logger.error(f"Error conectando a MP: {e}")
+            logger.error(f"Error en API MP: {e}")
             return {"encontrado": False, "pago": None, "pagos": [], "error": str(e)}
 
         pagos_raw = data.get("results", [])
         pagos_procesados = []
 
-        for p in pagos_raw[:10]: # Analizamos un poco más de los que mostramos por si hay filtros
-            p["_nombre_pagador"] = extraer_identificador_pagador(p)
-            p["_hora_arg"] = formatear_hora_arg(p.get("date_approved"))
-            p["_email_pagador"] = p.get("payer", {}).get("email", "Sin email")
-            p["_monto_limpio"] = float(p.get("transaction_amount", 0))
+        for p in pagos_raw:
+            # Enriquecemos el objeto con los datos limpios
+            datos_p = extraer_datos_pagador(p)
+            p["_nombre_pagador"] = datos_p["nombre"]
+            p["_email_pagador"] = datos_p["email"]
+            p["_hora_arg"] = formatear_hora_arg(p.get("date_approved", ""))
             
-            # Filtro por monto si no es modo lista
+            monto_actual = float(p.get("transaction_amount", 0))
+            p["_monto_limpio"] = monto_actual
+
+            # Lógica de filtrado por monto
             if monto:
-                diferencia = abs(p["_monto_limpio"] - monto) / monto if monto > 0 else 1
+                diferencia = abs(monto_actual - monto) / monto if monto > 0 else 1
                 if diferencia <= TOLERANCIA_PORCENTAJE:
                     pagos_procesados.append(p)
-                    if not modo_lista: break # Encontramos el que buscábamos
+                    if not modo_lista: break
             else:
                 pagos_procesados.append(p)
 
+        # Retorno consistente para tu main.py
         return {
             "encontrado": len(pagos_procesados) > 0,
             "pago": pagos_procesados[0] if pagos_procesados else None,
